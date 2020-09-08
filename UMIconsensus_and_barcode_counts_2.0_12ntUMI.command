@@ -1,0 +1,205 @@
+#!/bin/sh
+
+##### The purpose of this script is to take the UMI-confirmed consensus sequences
+##### and count the different barcodes. The UMItools_fastQ-to-consensus pipeline
+##### must be completed prior to running this pipeline.
+
+### User input for run parameters ###
+echo "What is the path to the directory with the raw fastq.gz files? e.g. /PATH/TO/FASTQ"
+read rawfastqdir
+
+echo "What is the path for the output directory? e.g. /Path/To/Output"
+read outputdir
+
+echo "What is the name of the sample?"
+read sample
+
+echo "What replicate number is this? e.g. rep1 or rep2"
+read rep
+
+echo "How many vRNA copies were used as input for library prep (log10)? e.g. 7.41"
+read inputRNA
+
+cd ${outputdir}
+
+### QC raw fastq files ###
+fastqc ${rawfastqdir}/*R1-${sample}.fastq.gz
+fastqc ${rawfastqdir}/*R2-${sample}.fastq.gz
+
+mkdir ./fastqc
+mv ${rawfastqdir}/*R1-${sample}_fastqc.html ./fastqc/
+mv ${rawfastqdir}/*R1-${sample}_fastqc.zip ./fastqc/
+mv ${rawfastqdir}/*R2-${sample}_fastqc.html ./fastqc/
+mv ${rawfastqdir}/*R2-${sample}_fastqc.zip ./fastqc/
+
+read1=`find ${rawfastqdir} -name "${sample}-${rep}*R1*_001.fastq.gz" ! -name '*._*'`
+read2=`find ${rawfastqdir} -name "${sample}-${rep}*R2*_001.fastq.gz" ! -name '*._*'`
+
+### Trim reads to 139 bp ###
+
+java -jar PATH/TO/trimmomatic-0.39.jar PE \
+	${read1} \
+		${read2} \
+			 R1_paired.fastq \
+				 R1_unpaired.fastq \
+					 R2_paired.fastq \
+						 R2_unpaired.fastq \
+							 CROP:200 \
+								 TRAILING:35
+
+### Merge reads with bbmerge ###
+
+PATH/TO/bbmerge.sh \
+	in1=R1_paired.fastq \
+		in2=R2_paired.fastq \
+			out=merged_${sample}.fastq \
+				trimnonoverlapping=t
+
+### Crop to 143 bp ###
+
+java -jar PATH/TO/trimmomatic-0.39.jar SE \
+	./merged_${sample}.fastq \
+		merged_cropped_${sample}.fastq \
+			CROP:143
+
+### Filter merged reads to 143 bp ###
+
+PATH/TO/reformat.sh \
+	in=./merged_cropped_${sample}.fastq \
+		out=lf_bbmerge_${sample}.fastq \
+			minlength=143 \
+				maxlength=143 \
+					ow=t
+
+### Filter reads with average quality score <35 ###
+
+fastp -i ./lf_bbmerge_${sample}.fastq \
+	-o qf_lf_bbmerge_${sample}.fastq \
+		--average_qual=35
+
+### Call python script to extract UMIs from merged fastq ###
+
+python PATH/TO/fastQ_to_UMI_list_12ntUMI.py $outputdir $sample $rep $inputRNA
+
+### Use Umi-tools to extract UMIs from merged fastq ###
+
+umi_tools extract \
+	-p NNNNNNNNNNNN \
+		--3prime \
+			--quality-filter-threshold=35 \
+				--quality-encoding=phred33 \
+					-I ./qf_lf_bbmerge_${sample}.fastq \
+						-S umiextracted_lf_bbmerge_${sample}.fastq
+
+### Map merged reads to ZIKV consensus ###
+
+bwa mem \
+	-t 4 \
+		-T 90 \
+			/PATH/TO/REFERENCE.fasta \
+				./umiextracted_lf_bbmerge_${sample}.fastq \
+					> umiextracted_lf_bbmerge_${sample}.bam
+
+### Group reads by UMI ###
+
+umi_tools group \
+	-I ./umiextracted_lf_bbmerge_${sample}.bam \
+		--group-out=UMI_groups_${sample}.tsv \
+			-S grouped_umiextracted_lf_bbmerge_${sample}.bam \
+				--output-bam \
+					--method=adjacency \
+						--edit-distance-threshold=1
+
+### Convert bam file to fasta file ###
+
+samtools fasta \
+	-T BX \
+		./grouped_umiextracted_lf_bbmerge_${sample}.bam \
+			> grouped_umiextracted_lf_bbmerge_${sample}.fasta
+
+### Rename header to contain just the UMI sequence ###
+
+sed 's/.*Z:\(.*\)/>\1/g' \
+	./grouped_umiextracted_lf_bbmerge_${sample}.fasta \
+		> umiheader_grouped_umiextracted_lf_bbmerge_${sample}.fasta
+
+### Generate list of UMIs passing the n>=3 cutoff ###
+
+Rscript PATH/TO/UMI_filter_list.R $outputdir $sample $rep $inputRNA
+
+### Filter UMI groups for UMI count >=3 ###
+
+seqtk subseq \
+	./umiheader_grouped_umiextracted_lf_bbmerge_${sample}.fasta \
+		./passumifilter.lst \
+			> grouped_reads_passing_cutoff_${sample}_${rep}.fasta \
+				ow=t
+
+### split fasta files according to the header ###
+
+seqkit split \
+	--by-id \
+		--id-regexp "\[(.+)\]" \
+			./grouped_reads_passing_cutoff_${sample}_${rep}.fasta
+
+### Call python script to generate fasta file with UMI consensus sequences ###
+
+python PATH/TO/fastQ_to_UMI_consensus_2.0.py $outputdir $sample $rep
+
+### Filter reads with ambiguous basecalls (Ns) ###
+
+cutadapt \
+	--max-n 0 \
+		--report=minimal \
+			-o Nfilter_${sample}.fasta \
+				./consensus_${sample}_ZIKV_UMI.fasta \
+					> Nfilter_summary.tsv
+
+### Trim UMI-confirmed consensus reads to contain only barcode regions ###
+
+PATH/TO/bbduk.sh \
+	in=./Nfilter_${sample}.fasta \
+		out=trimmed_Nfilter_${sample}.fasta \
+			ow=t \
+				forcetrimleft=57 \
+					forcetrimright=80
+
+### Count barcodes (kmers) ###
+
+PATH/TO/kmercountexact.sh \
+	in=./trimmed_Nfilter_${sample}.fasta \
+		out=kmer_counts_${sample}.fasta \
+			k=24 \
+				khist=kmer_freq_hist_${sample}.tsv \
+					fastadump=t \
+						rcomp=f \
+							ow=t
+
+### Convert barcode count file from fasta to tsv ###
+
+seqkit fx2tab ./kmer_counts_${sample}.fasta -H > kmer_counts_${sample}.tsv
+
+### Organize and clean up files generated by pipeline ###
+
+mkdir ./barcode_analyses
+mv ./Nfilter_${sample}.fasta ./barcode_analyses/
+mv ./Nfilter_summary.tsv ./barcode_analyses/
+mv ./trimmed_Nfilter_${sample}.fasta ./barcode_analyses/
+mv ./kmer_counts_${sample}.tsv ./barcode_analyses/
+mv ./kmer_counts_${sample}.fasta ./barcode_analyses/
+mv ./kmer_freq_hist_${sample}.tsv ./barcode_analyses/
+mv ./UMI_groups_${sample}.tsv ./barcode_analyses/
+
+mkdir ./consensus_umi_reads
+mv ./passumifilter.lst ./consensus_umi_reads/
+mv ./conversionrate.csv ./consensus_umi_reads/
+mv ./consensus_${sample}_ZIKV_UMI.fasta ./consensus_umi_reads/
+mv ./grouped*.fasta.split/ ./consensus_umi_reads/
+mv ./grouped*.fasta ./consensus_umi_reads/
+mv ./umiheader*.fasta ./consensus_umi_reads/
+
+rm ./merged*.fastq
+rm ./*.bam
+rm ./*.fastq
+
+exit 1
