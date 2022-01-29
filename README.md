@@ -19,6 +19,10 @@ Repository for scripts to process, analyze, and visualize NGS data from barcoded
 4. Euclidean_distance_meanbcfreqs.R
 
    R script to calculate Euclidean distance between barcode populations of two samples.
+  
+5. Barcodes_overtime_COMPOSITE.R
+
+   R script to plot composite barcode trajectories for each passage series.
      
 ### ZIKV Whole-Genome Sequencing Analyses
 1. ZIKV_OverlappingAmplicon_WGS_PE150_v3.1_LOOP2.command
